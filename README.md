@@ -95,11 +95,19 @@ TSV tool, `drama3_batch`.
 | + fused MoE adds, fewer copies, codec graphs per 32-frame bucket, batch 8 | 39.7 ms | 0.204 | |
 | + mat-vec paths up to 16 columns, batch 16 | 70.4 ms | 0.154 | ~30 GiB |
 | + common suffix tokens in the cached voice prefix, batch 16 | 76.2 ms | 0.161 | ~30 GiB |
+| Final, batch 16 (256 lines, 1,711 s of audio) | 75.1 ms | **0.159** | 29.1 GiB |
 
 End-to-end includes reference encoding, generation, codec decode and writing wavs, on short game lines (3-10 s).
-The quality check at the faster settings (WhisperX WER and speaker similarity on a fixed 20-line set) is still in
-progress; at batch 8 every plain line transcribed exactly apart from one runaway take, and runaway takes are now
-capped and regenerated once with another seed.
+Quality held: on a fixed 20-line set from 4 voices (8 with inline tags), WhisperX large-v3 word error rate was 0.5%
+for the final batch-16 build against 1.2% for the stock CLI, and WeSpeaker speaker similarity 0.729 against 0.721.
+About 1 line in 250 still runs away; every line is capped by its length (100 frames + 4.5 per character + 65 per pause
+tag), and a capped line is regenerated once with another seed inside the batch and listed in `<out>/limited.tsv`.
+Peak VRAM is about 29 GiB, so the job needs most of the card.
+
+Usage (from the fork's build): `drama3_batch` reads the same TSV as `fish/fish_clone.py`
+(`out_name<TAB>voice<TAB>text[<TAB>ref_text]`, voices as `<voices-dir>/<name>.wav` plus a `.txt` transcript), writes
+44.1 kHz mono wavs to `<out>/<out_name>.wav`, skips existing outputs, and reads `[crying]`/`[sobbing]` as `[tearful]`
+(Drama 3 sometimes turns a long crying-tagged line into crying with almost no words).
 
 What made the difference, and where it stops:
 - **One graph per step for the whole batch:** the stock port runs 16 separate graph computes per audio frame, each
