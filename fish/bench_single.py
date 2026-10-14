@@ -71,10 +71,13 @@ def main():
     print(f"{torch.xpu.get_device_name(0)}  torch {torch.__version__}  {vars(a)}", flush=True)
 
     t = time.time()
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from b70_load import to_dev_chunked, xe_watchdog
+    xe_watchdog()
     model = DualARTransformer.from_pretrained(CKPT, load_weights=True, max_length=a.max_length).to(torch.bfloat16)
     if a.quant == "int8":
         print(f"quantized {quantize(model)} linears", flush=True)
-    model = model.to(DEV).eval(); model._cache_setup_done = False
+    model = to_dev_chunked(model, DEV).eval(); model._cache_setup_done = False
     decode_one = decode_one_token_ar
     if a.kv_bucket:
         cap, b = a.max_length, a.kv_bucket
@@ -89,7 +92,7 @@ def main():
     if a.graph:
         import xpu_graph_decode
         dec = xpu_graph_decode.install(model, bucket=a.kv_bucket or 256)
-    codec = load_codec_model(os.path.join(CKPT, "codec.pth"), DEV, torch.bfloat16); sr = codec.sample_rate
+    codec = to_dev_chunked(load_codec_model(os.path.join(CKPT, "codec.pth"), "cpu", torch.bfloat16), DEV); sr = codec.sample_rate
     torch.xpu.synchronize(); t_load = time.time() - t
     print(f"load {t_load:.1f} s; VRAM {torch.xpu.memory_allocated() / 2**30:.2f} GiB", flush=True)
 

@@ -29,6 +29,10 @@ of description, `demo/fish-clone-narrator.wav` is Fish S2 Pro cloning it on a ne
   - `bench_qwen.py`: the Qwen benchmark.
 - `setup.sh`, `requirements/`: from-scratch setup with exact pins and no CUDA wheels.
 - `bench/`: raw benchmark TSVs. `examples/`: the TSVs used in the usage section.
+- `b70_load.py`: safe model loading for every torch-XPU loader here (chunked host-to-device copies and an xe fault
+  watchdog, see Gotchas).
+- **Fish Audio Drama 3** runs through a fork of audio.cpp instead of PyTorch:
+  [horvay/audio.cpp](https://github.com/horvay/audio.cpp) (`main`). See the Drama 3 section below.
 
 ## Results
 
@@ -75,6 +79,40 @@ including batch 8 with graphs, are in `bench/qwen.tsv`.
 
 The XPU path keeps the stock HF `generate()` for the 28-layer talker and replaces only the per-frame code predictor
 (see below). Batching rows of different lengths is native in `qwen-tts`.
+
+### Fish Audio Drama 3 (voice clone, 44.1 kHz, audio.cpp + Vulkan)
+
+Drama 3 (released 2026-10-13) is a 35B mixture-of-experts model with about 3B active parameters per token. The
+official weights are 41.5 GB and don't fit the B70, so it runs as the community Q4_K GGUF
+(`Jmica/Drama-3-GGUF`, `drama-3-experts-q4_k-backbone-q8_0.gguf`, 24.6 GB) in audio.cpp's native port through
+ggml's Vulkan backend on Mesa. Stock audio.cpp generates one line at a time; the fork adds a batched engine and a
+TSV tool, `drama3_batch`.
+
+| Setup | Step time | End-to-end s/s | Peak VRAM |
+| --- | --- | --- | --- |
+| Stock audio.cpp CLI, one line at a time | ~45 ms per frame | 0.875-1.18 | ~23 GiB |
+| Batch engine, batch 8 | 44 ms | 0.286 | 24.7 GiB |
+| + fused MoE adds, fewer copies, codec graphs per 32-frame bucket, batch 8 | 39.7 ms | 0.204 | |
+| + mat-vec paths up to 16 columns, batch 16 | 70.4 ms | 0.154 | ~30 GiB |
+| + common suffix tokens in the cached voice prefix, batch 16 | 76.2 ms | 0.161 | ~30 GiB |
+
+End-to-end includes reference encoding, generation, codec decode and writing wavs, on short game lines (3-10 s).
+The quality check at the faster settings (WhisperX WER and speaker similarity on a fixed 20-line set) is still in
+progress; at batch 8 every plain line transcribed exactly apart from one runaway take, and runaway takes are now
+capped and regenerated once with another seed.
+
+What made the difference, and where it stops:
+- **One graph per step for the whole batch:** the stock port runs 16 separate graph computes per audio frame, each
+  with a blocking readback and CPU-side sampling. The batch engine runs the backbone, a 4,097-row slice of the LM
+  head, GPU Gumbel-max sampling with RAS and all 13 codebook tower layers in one graph, reads back 10 ints per row,
+  refills finished rows continuously, and computes each voice's reference prefix once.
+- **Codec decode graphs cached per 32-frame bucket:** decode went from 0.078 to 0.025 s/s.
+- **Mat-vec kernels for up to 16 columns:** ggml-vulkan's tiled matmul shaders have a large fixed cost per k step on
+  this card, so any matmul over 8 columns cost 80-400 us. Letting the mat-vec path take up to 16 columns made batch
+  16 cost about the same per row as batch 8.
+- **The wall:** at batch 16 a row-step needs about 3.5 B multiply-adds, and the DP4A/FMA kernels top out near 1.35 T
+  multiply-adds/s, so the dense layers are arithmetic-bound. The XMX matrix engines (coopmat2) only pay off at 128+
+  columns on Mesa, well above what a batch of game lines gives. Batch 32 is no faster per row than batch 16.
 
 ## What helped and what didn't
 
@@ -200,6 +238,11 @@ Fish rows, and `fish/fish_clone.py ... --batch N --bench-tsv bench/fish_batch.ts
   (they are decoded with the reference prepended, so 15-20 s each) intermittently failed in the codec's conv layers
   at batch 8-32 with most of the 32 GB still free. `xpu_fast.limit_codec_batch` decodes in fixed-shape groups of at most 1024
   padded frames; output matches upstream's batched decode.
+- **xe engine faults on large host-to-device copies.** Moving a model to the B70 in one `.to("xpu")` pins large
+  tensors (Fish's 800 MiB embedding) as userptr; under host memory pressure the pin times out and the copy engine
+  faults ("Engine memory CAT error, class=bcs", engine reset, the job hangs; intel/compute-runtime#1010).
+  `b70_load.to_dev_chunked` copies in pieces of at most 32 MiB, and `xe_watchdog` exits the process when the kernel
+  log shows an xe fault, so a faulted job fails fast instead of hanging.
 - **SoX warning:** `qwen-tts` prints "SoX could not be found!" at import. It is not used on this path.
 - **Python launch speed matters.** Even with graphs, both models are CPU-bound on the host side; other heavy CPU load
   on the machine shows up directly in the timings.

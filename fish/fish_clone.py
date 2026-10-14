@@ -101,9 +101,12 @@ def main():
     if not jobs:
         return
     t = time.time()
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from b70_load import to_dev_chunked, xe_watchdog
+    xe_watchdog()
     model = DualARTransformer.from_pretrained(CKPT, load_weights=True, max_length=a.max_length).to(torch.bfloat16)
-    model = model.to(DEV).eval()
-    codec = load_codec_model(os.path.join(CKPT, "codec.pth"), DEV, torch.bfloat16); sr = codec.sample_rate
+    model = to_dev_chunked(model, DEV).eval()
+    codec = to_dev_chunked(load_codec_model(os.path.join(CKPT, "codec.pth"), "cpu", torch.bfloat16), DEV); sr = codec.sample_rate
     bf = xpu_batch.BatchFish(model, a.batch, bucket=a.kv_bucket, use_graph=not a.no_graph,
                              temperature=a.temperature, top_p=a.top_p, top_k=a.top_k)
     torch.xpu.synchronize(); t_load = time.time() - t
